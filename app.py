@@ -9,7 +9,7 @@ import datetime
 import math
 import sys
 import io
-import hashlib  # NYTT: För att skapa unika ID:n på frågor
+import hashlib
 import google.generativeai as genai
 from google.cloud import firestore
 from google.oauth2 import service_account
@@ -102,11 +102,9 @@ def spara_till_db_smart(post):
 
 # --- NYA FUNKTIONER FÖR MINNET ---
 def skapa_hash(text):
-    """Skapar ett unikt ID baserat på frågan."""
     return hashlib.md5(text.lower().strip().encode()).hexdigest()
 
 def hitta_sparad_analys(fraga):
-    """Kollar om vi redan har svarat på denna fråga."""
     fraga_id = skapa_hash(fraga)
     doc = db.collection("analyser").document(fraga_id).get()
     if doc.exists:
@@ -114,7 +112,6 @@ def hitta_sparad_analys(fraga):
     return None
 
 def spara_analys(fraga, svar, kod=""):
-    """Sparar AI:ns svar i databasen."""
     fraga_id = skapa_hash(fraga)
     data = {
         "fraga": fraga,
@@ -252,16 +249,16 @@ with tab2:
                     st.session_state["valt_dok"] = r.to_dict()
                     st.rerun()
 
-# === FLIK 3: AI-CHATT (SMART MINNE) ===
+# === FLIK 3: AI-CHATT (GEMINI PRO + MINNE) ===
 with tab3:
     st.header("🧠 Analysera hela databasen")
-    st.caption("AI:n minns tidigare svar för att spara tid!")
+    st.caption("Drivs av Gemini 1.5 Pro – den smartaste modellen.")
     
     tvinga_ny = st.checkbox("🔄 Tvinga ny analys (Ignorera minnet)")
     df_all = ladda_index()
     
     if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": "Hej! Vad vill du veta?"}]
+        st.session_state.messages = [{"role": "assistant", "content": "Hej! Vad vill du veta om riksdagsdatan?"}]
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -276,12 +273,9 @@ with tab3:
             sparad = hitta_sparad_analys(prompt)
             
             if sparad and not tvinga_ny:
-                # Snabbt svar från minnet!
                 st.info(f"💡 Hämtade sparat svar från {sparad['datum']}")
                 st.markdown(sparad['svar'])
                 st.session_state.messages.append({"role": "assistant", "content": sparad['svar']})
-                
-                # Om det fanns kod sparad, kör den
                 if sparad.get('kod'):
                     try:
                         meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
@@ -292,8 +286,8 @@ with tab3:
                     except: pass
 
             else:
-                # 2. GÖR NY ANALYS (Om inget i minnet eller tvingad)
-                with st.spinner("Söker och analyserar (Detta sparas sen)..."):
+                # 2. GÖR NY ANALYS MED GEMINI 1.5 PRO
+                with st.spinner("Pro-modellen tänker... (Detta kan ta några sekunder extra)"):
                     try:
                         meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
                         csv_data = meta_df.to_csv(index=False)
@@ -308,29 +302,28 @@ with tab3:
                                 text_context += f"\n--- DOKUMENT: {row['titel']} ({row['parti']}) ---\n{row['full_text'][:2500]}...\n"
 
                         system_prompt = f"""
-                        Du är en data-analytiker för Riksdagen.
-                        - Använd CSV-datan för statistik.
-                        - Använd TEXT-datan för åsikter/innehåll.
+                        Du är en avancerad data-analytiker för Riksdagen.
+                        - Analysera CSV-datan för statistik och trender.
+                        - Analysera TEXT-datan djupt för åsikter och innehåll.
+                        - Var noga med detaljer.
                         - Om diagram behövs: Skriv Python-kod med `px.bar` etc.
                         - Koden måste börja med ```python och sluta med ```. Spara figuren i `fig`.
                         """
                         
                         full_prompt = f"{system_prompt}\n\nCSV:\n{csv_data}\n\nTEXT:\n{text_context}\n\nFRÅGA: {prompt}"
 
-                        model = genai.GenerativeModel("gemini-1.5-flash")
+                        # HÄR BYTER VI TILL PRO-MODELLEN
+                        model = genai.GenerativeModel("gemini-1.5-pro") 
                         response = model.generate_content(full_prompt)
                         ai_text = response.text
                         
-                        # Extrahera kod och text
                         code_match = re.search(r"```python(.*?)```", ai_text, re.DOTALL)
                         clean_text = re.sub(r"```python.*?```", "", ai_text, flags=re.DOTALL)
                         kod_att_spara = code_match.group(1) if code_match else ""
 
-                        # Visa svar
                         st.markdown(clean_text)
                         st.session_state.messages.append({"role": "assistant", "content": clean_text})
                         
-                        # Kör kod
                         if kod_att_spara:
                             local_env = {"meta_df": meta_df, "top_docs": top_docs, "pd": pd, "px": px}
                             try:
@@ -339,8 +332,7 @@ with tab3:
                                     st.plotly_chart(local_env["fig"], use_container_width=True)
                             except Exception as e: st.warning(f"Kodfel: {e}")
 
-                        # 3. SPARA TILL MINNET
                         spara_analys(prompt, clean_text, kod_att_spara)
 
                     except Exception as e:
-                        st.error(f"Ett fel uppstod: {e}")
+                        st.error(f"Ett fel uppstod med Gemini Pro: {e}")
