@@ -100,26 +100,39 @@ def spara_till_db_smart(post):
             'index': i, 'text_part': chunk, 'parent_id': post['dok_id']
         })
 
-# --- NYA FUNKTIONER FÖR MINNET ---
+# --- MINNES- & AI-FUNKTIONER ---
 def skapa_hash(text):
     return hashlib.md5(text.lower().strip().encode()).hexdigest()
 
 def hitta_sparad_analys(fraga):
     fraga_id = skapa_hash(fraga)
     doc = db.collection("analyser").document(fraga_id).get()
-    if doc.exists:
-        return doc.to_dict()
+    if doc.exists: return doc.to_dict()
     return None
 
 def spara_analys(fraga, svar, kod=""):
     fraga_id = skapa_hash(fraga)
     data = {
-        "fraga": fraga,
-        "svar": svar,
-        "kod": kod,
+        "fraga": fraga, "svar": svar, "kod": kod,
         "datum": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     db.collection("analyser").document(fraga_id).set(data)
+
+def kor_ai_analys(full_prompt):
+    """Försöker med bästa modellen först, faller tillbaka på stabil om det krånglar."""
+    modeller_att_testa = ["gemini-1.5-pro-latest", "gemini-1.5-pro", "gemini-pro"]
+    
+    for modell_namn in modeller_att_testa:
+        try:
+            model = genai.GenerativeModel(modell_namn)
+            response = model.generate_content(full_prompt)
+            return response.text, modell_namn # Returnera svar + vilken modell som funkade
+        except Exception as e:
+            # Om det är sista modellen och det fortfarande inte funkar, kasta felet
+            if modell_namn == modeller_att_testa[-1]:
+                raise e
+            continue # Annars, testa nästa i listan
+    return None, None
 
 @st.cache_data(ttl=600)
 def ladda_index():
@@ -249,10 +262,10 @@ with tab2:
                     st.session_state["valt_dok"] = r.to_dict()
                     st.rerun()
 
-# === FLIK 3: AI-CHATT (GEMINI PRO + MINNE) ===
+# === FLIK 3: AI-CHATT ===
 with tab3:
     st.header("🧠 Analysera hela databasen")
-    st.caption("Drivs av Gemini 1.5 Pro – den smartaste modellen.")
+    st.caption("AI:n väljer automatiskt den bästa tillgängliga modellen.")
     
     tvinga_ny = st.checkbox("🔄 Tvinga ny analys (Ignorera minnet)")
     df_all = ladda_index()
@@ -269,7 +282,6 @@ with tab3:
         with st.chat_message("user"): st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            # 1. KOLLA I MINNET FÖRST
             sparad = hitta_sparad_analys(prompt)
             
             if sparad and not tvinga_ny:
@@ -281,58 +293,3 @@ with tab3:
                         meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
                         local_env = {"meta_df": meta_df, "pd": pd, "px": px}
                         exec(sparad['kod'], {}, local_env)
-                        if "fig" in local_env:
-                            st.plotly_chart(local_env["fig"], use_container_width=True)
-                    except: pass
-
-            else:
-                # 2. GÖR NY ANALYS MED GEMINI 1.5 PRO
-                with st.spinner("Pro-modellen tänker... (Detta kan ta några sekunder extra)"):
-                    try:
-                        meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
-                        csv_data = meta_df.to_csv(index=False)
-                        
-                        keywords = prompt.lower().split()
-                        df_all['relevance'] = df_all['full_text'].apply(lambda x: sum(x.lower().count(kw) for kw in keywords) if x else 0)
-                        top_docs = df_all.sort_values('relevance', ascending=False).head(20)
-                        
-                        text_context = ""
-                        for _, row in top_docs.iterrows():
-                            if row['relevance'] > 0:
-                                text_context += f"\n--- DOKUMENT: {row['titel']} ({row['parti']}) ---\n{row['full_text'][:2500]}...\n"
-
-                        system_prompt = f"""
-                        Du är en avancerad data-analytiker för Riksdagen.
-                        - Analysera CSV-datan för statistik och trender.
-                        - Analysera TEXT-datan djupt för åsikter och innehåll.
-                        - Var noga med detaljer.
-                        - Om diagram behövs: Skriv Python-kod med `px.bar` etc.
-                        - Koden måste börja med ```python och sluta med ```. Spara figuren i `fig`.
-                        """
-                        
-                        full_prompt = f"{system_prompt}\n\nCSV:\n{csv_data}\n\nTEXT:\n{text_context}\n\nFRÅGA: {prompt}"
-
-                        # HÄR BYTER VI TILL PRO-MODELLEN
-                        model = genai.GenerativeModel("gemini-1.5-pro") 
-                        response = model.generate_content(full_prompt)
-                        ai_text = response.text
-                        
-                        code_match = re.search(r"```python(.*?)```", ai_text, re.DOTALL)
-                        clean_text = re.sub(r"```python.*?```", "", ai_text, flags=re.DOTALL)
-                        kod_att_spara = code_match.group(1) if code_match else ""
-
-                        st.markdown(clean_text)
-                        st.session_state.messages.append({"role": "assistant", "content": clean_text})
-                        
-                        if kod_att_spara:
-                            local_env = {"meta_df": meta_df, "top_docs": top_docs, "pd": pd, "px": px}
-                            try:
-                                exec(kod_att_spara, {}, local_env)
-                                if "fig" in local_env:
-                                    st.plotly_chart(local_env["fig"], use_container_width=True)
-                            except Exception as e: st.warning(f"Kodfel: {e}")
-
-                        spara_analys(prompt, clean_text, kod_att_spara)
-
-                    except Exception as e:
-                        st.error(f"Ett fel uppstod med Gemini Pro: {e}")
