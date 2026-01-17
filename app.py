@@ -8,262 +8,247 @@ import time
 import datetime
 import math
 import sys
+import io
 from google import genai
 from google.cloud import firestore
 from google.oauth2 import service_account
+from pypdf import PdfReader  # NYTT: För att läsa PDF:er
 
 # Fixar teckenkodning och stora heltal
 sys.stdout.reconfigure(encoding='utf-8')
 sys.set_int_max_str_digits(0)
 
-# --- 1. KONFIGURATION & DATABAS-KOPPLING ---
+# --- 1. KONFIGURATION & DATABAS ---
 st.set_page_config(page_title="Partikollen Dashboard", page_icon="🏛️", layout="wide")
 
-# HÄMTA API-NYCKEL (GEMINI)
 if "GOOGLE_API_KEY" in st.secrets:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
+    client = genai.Client(api_key=API_KEY)
 else:
-    st.error("Ingen Google API-nyckel hittades i Secrets.")
+    st.error("Ingen Google API-nyckel hittades.")
     st.stop()
 
-client = genai.Client(api_key=API_KEY)
-
-# KOPPLA TILL FIRESTORE (DATABASEN)
 if "FIREBASE_KEY" in st.secrets:
     try:
-        key_dict = json.loads(st.secrets["FIREBASE_KEY"])
+        key_input = st.secrets["FIREBASE_KEY"]
+        key_dict = json.loads(key_input) if isinstance(key_input, str) else key_input
         creds = service_account.Credentials.from_service_account_info(key_dict)
         db = firestore.Client(credentials=creds, project=key_dict["project_id"])
         st.sidebar.success("✅ Molndatabas")
     except Exception as e:
-        st.error(f"Kunde inte koppla till databasen: {e}")
+        st.error(f"Databasfel: {e}")
         st.stop()
 else:
-    st.warning("⚠️ Ingen databasnyckel hittad.")
+    st.warning("⚠️ Ingen databasnyckel.")
     st.stop()
 
 # --- 2. HJÄLPFUNKTIONER ---
 
-def stada_html(html_text):
-    if not html_text: return ""
-    html_text = html_text.replace("</td>", " ").replace("</th>", " ").replace("</tr>", "\n") 
-    text = re.sub(r'<[^<]+?>', ' ', html_text)
+def stada_text(text):
+    if not text: return ""
+    # Tar bort HTML-taggar och städar mellanslag
+    text = re.sub(r'<[^<]+?>', ' ', text)
+    text = text.replace("HTML", "").replace("Dokumentet är inte publicerat", "")
     return " ".join(text.split())
+
+def hamta_pdf_text(dok_id):
+    """Försöker ladda ner PDF och extrahera text om HTML saknas."""
+    pdf_url = f"https://data.riksdagen.se/fil/{dok_id}"
+    try:
+        resp = requests.get(pdf_url, timeout=10)
+        if resp.status_code == 200:
+            # Läs PDF från minnet
+            with io.BytesIO(resp.content) as f:
+                reader = PdfReader(f)
+                full_text = ""
+                for page in reader.pages:
+                    full_text += page.extract_text() + "\n"
+                return stada_text(full_text)
+    except Exception:
+        return "" # Om det misslyckas, returnera tom sträng
+    return ""
+
+def hamta_full_text(doc_dict):
+    """Hämtar ihopfogad text från chunks om det behövs."""
+    texten = doc_dict.get('full_text', '')
+    if doc_dict.get('is_chunked'):
+        try:
+            parts_ref = db.collection("riksdagen_docs").document(doc_dict['dok_id']).collection('text_parts')
+            parts = parts_ref.stream()
+            sorted_parts = sorted([p.to_dict() for p in parts], key=lambda x: x['index'])
+            for part in sorted_parts:
+                texten += part.get('text_part', '')
+        except Exception: pass
+    return texten
 
 def hitta_parti(dok, doktyp):
     if doktyp == 'bet': return "Utskottet"
     if doktyp == 'prop': return "Regeringen"
     if dok.get('parti') and dok.get('parti') != "-": return dok['parti'].upper()
-    text = (dok.get('subtitel') or "") + " " + (dok.get('titel') or "")
-    match = re.search(r'\(([A-Z]{1,2})\)', text)
-    if match: return match.group(1)
     return "-"
 
-def hamta_full_text(doc_dict):
-    """Om dokumentet är uppdelat, hämta resten och limma ihop."""
-    texten = doc_dict.get('full_text', '')
+def spara_till_db_smart(post):
+    """Sparar och chunkar om texten är för stor (PDF:er kan vara enorma)."""
+    MAX_BYTES = 900000
+    doc_ref = db.collection("riksdagen_docs").document(post['dok_id'])
+    texten = post.get('full_text', '')
     
-    if doc_dict.get('is_chunked'):
-        try:
-            # Hämta delarna från under-kollektionen
-            parts_ref = db.collection("riksdagen_docs").document(doc_dict['dok_id']).collection('text_parts')
-            parts = parts_ref.stream()
-            
-            # Sortera dem så de kommer i rätt ordning (1, 2, 3...)
-            sorted_parts = sorted([p.to_dict() for p in parts], key=lambda x: x['index'])
-            
-            for part in sorted_parts:
-                texten += part.get('text_part', '')
-        except Exception as e:
-            st.warning(f"Kunde inte hämta alla textdelar: {e}")
-            
-    return texten
+    # Om texten är liten, spara direkt
+    if len(texten.encode('utf-8')) < MAX_BYTES:
+        doc_ref.set(post)
+        return
+    
+    # Om stor -> Chunka!
+    chunks = [texten[i:i+MAX_BYTES] for i in range(0, len(texten), MAX_BYTES)]
+    post['full_text'] = chunks[0]
+    post['is_chunked'] = True
+    doc_ref.set(post)
+    
+    for i, chunk in enumerate(chunks[1:], start=1):
+        doc_ref.collection('text_parts').document(str(i)).set({
+            'index': i, 'text_part': chunk, 'parent_id': post['dok_id']
+        })
 
 @st.cache_data(ttl=600)
-def ladda_data_fran_db():
+def ladda_index():
     docs_list = []
     try:
-        docs = db.collection("riksdagen_docs").stream()
+        # Hämtar bara fälten vi behöver för listan för att spara bandbredd
+        docs = db.collection("riksdagen_docs").select(['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'full_text']).stream()
         for doc in docs:
-            docs_list.append(doc.to_dict())
-    except Exception as e:
-        st.error(f"Kunde inte läsa från databasen: {e}")
-        return pd.DataFrame()
+            d = doc.to_dict()
+            d['dok_id'] = doc.id
+            docs_list.append(d)
+    except Exception: return pd.DataFrame()
     
     if not docs_list: return pd.DataFrame()
-
     df = pd.DataFrame(docs_list)
-    if "datum" in df.columns:
-        df["datum"] = pd.to_datetime(df["datum"], errors='coerce')
+    if "datum" in df.columns: df["datum"] = pd.to_datetime(df["datum"], errors='coerce')
     return df
-
-def spara_till_db(post):
-    # Enkel spar-funktion för nya dokument (vi antar att de är små nog för nu)
-    doc_ref = db.collection("riksdagen_docs").document(post['dok_id'])
-    doc_ref.set(post)
 
 # --- 3. UI ---
 with st.sidebar:
     st.header("⚙️ Filter")
     idag = datetime.date.today()
-    en_manad_sen = idag - datetime.timedelta(days=30)
-    start_datum = st.date_input("Från:", en_manad_sen)
+    start_datum = st.date_input("Från:", idag - datetime.timedelta(days=30))
     slut_datum = st.date_input("Till:", idag)
 
 st.title("🏛️ Partikollen Cloud ☁️")
-
 tab1, tab2, tab3 = st.tabs(["📡 Inhämtning", "🔍 Utforskaren", "🧠 AI-Analys"])
 
-# === FLIK 1: INHÄMTNING ===
+# === FLIK 1: INHÄMTNING (NU MED PDF-STÖD!) ===
 with tab1:
-    st.header("Uppdatera Molndatabasen")
+    st.header("Hämta data (HTML + PDF)")
+    st.info("Nu försöker appen läsa PDF-filen om den vanliga texten saknas.")
+    
     c1, c2 = st.columns(2)
     with c1:
-        check_tal = st.checkbox("Debatter", value=True)
         check_mot = st.checkbox("Motioner & Prop", value=True)
-        check_beslut = st.checkbox("Beslut", value=True)
-        max_sidor = st.number_input("Max sidor:", min_value=1, value=5)
-        btn_start = st.button("🚀 Hämta nytt från Riksdagen", type="primary")
+        check_beslut = st.checkbox("Beslut (Betänkanden)", value=True)
+        max_sidor = st.number_input("Sidor att söka:", 1, 100, 3)
+        btn_run = st.button("🚀 Starta avancerad inhämtning", type="primary")
 
-    if btn_start:
-        status = st.status("Startar moln-inhämtning...", expanded=True)
-        from_str = start_datum.strftime("%Y-%m-%d")
-        tom_str = slut_datum.strftime("%Y-%m-%d")
+    if btn_run:
+        status = st.status("Startar...", expanded=True)
+        from_str, tom_str = start_datum.strftime("%Y-%m-%d"), slut_datum.strftime("%Y-%m-%d")
 
-        def kor_inhamtning(doktyp, label):
-            status.write(f"Söker efter: {label}...")
-            page = 1
-            totalt = 0
-            while page <= max_sidor:
-                url = f"https://data.riksdagen.se/dokumentlista/?doktyp={doktyp}&sz=20&p={page}&from={from_str}&tom={tom_str}&utformat=json"
+        def kor_jobb(doktyp, label):
+            status.write(f"Söker {label}...")
+            count = 0
+            for p in range(1, max_sidor + 1):
+                url = f"https://data.riksdagen.se/dokumentlista/?doktyp={doktyp}&sz=20&p={p}&from={from_str}&tom={tom_str}&utformat=json"
                 try:
-                    resp = requests.get(url)
-                    data = resp.json()
-                    if 'dokumentlista' not in data: break
-                    docs = data['dokumentlista'].get('dokument', [])
+                    data = requests.get(url).json()
+                    docs = data.get('dokumentlista', {}).get('dokument', [])
                     if not docs: break
                     if isinstance(docs, dict): docs = [docs]
 
-                    nya = 0
-                    for dok in docs:
-                        did = dok['dok_id']
-                        # Här skulle man kunna kolla om ID finns, men set() är billigt
-                        h_url = f"https://data.riksdagen.se/dokument/{did}.html"
-                        h_resp = requests.get(h_url)
+                    for d in docs:
+                        did = d['dok_id']
+                        
+                        # 1. Försök hämta HTML-text
+                        text_källa = "HTML"
+                        ren_text = ""
+                        h_resp = requests.get(f"https://data.riksdagen.se/dokument/{did}.html")
                         if h_resp.status_code == 200:
-                            ren_text = stada_html(h_resp.text)
-                            if doktyp == "mot": k = "Motion"
-                            elif doktyp == "prop": k = "Proposition"
-                            elif doktyp == "bet": k = "Beslut"
-                            else: k = "Debatt"
-                            
+                            ren_text = stada_text(h_resp.text)
+                        
+                        # 2. Om texten är misstänkt kort eller "ej publicerad" -> Hämta PDF
+                        if len(ren_text) < 200 or "inte publicerat" in h_resp.text:
+                            status.write(f"📄 Hämtar PDF för {did}...")
+                            pdf_text = hamta_pdf_text(did)
+                            if len(pdf_text) > len(ren_text):
+                                ren_text = pdf_text
+                                text_källa = "PDF"
+                        
+                        # 3. Spara
+                        if ren_text:
+                            typ_map = {"mot": "Motion", "prop": "Proposition", "bet": "Beslut"}
                             post = {
-                                'dok_id': did, 'titel': dok['titel'], 'datum': dok['datum'],
-                                'full_text': ren_text, 'typ': doktyp, 'Kategori': k,
-                                'parti': hitta_parti(dok, doktyp), 'subtitel': dok.get('subtitel', ''),
-                                'beslut': dok.get('beslut', '')
+                                'dok_id': did, 'titel': d['titel'], 'datum': d['datum'],
+                                'full_text': ren_text, 'typ': doktyp, 
+                                'Kategori': typ_map.get(doktyp, "Övrigt"),
+                                'parti': hitta_parti(d, doktyp), 'Källa': text_källa
                             }
-                            spara_till_db(post)
-                            nya += 1
-                            time.sleep(0.05)
-                    totalt += nya
-                    status.write(f"{label} Sida {page}: {nya} st.")
-                    if nya == 0: break
-                    page += 1
-                except Exception as e:
-                    status.warning(f"Fel: {e}")
-                    page += 1
-            return totalt
+                            spara_till_db_smart(post)
+                            count += 1
+                            time.sleep(0.1)
+                except Exception as e: status.warning(f"Fel på sida {p}: {e}")
+            return count
 
         tot = 0
-        if check_tal: tot += kor_inhamtning("prot", "Debatter")
-        if check_mot: tot += kor_inhamtning("mot", "Motioner") + kor_inhamtning("prop", "Propositioner")
-        if check_beslut: tot += kor_inhamtning("bet", "Beslut")
+        if check_mot: tot += kor_jobb("mot", "Motioner") + kor_jobb("prop", "Propositioner")
+        if check_beslut: tot += kor_jobb("bet", "Beslut")
         
-        status.success(f"Klar! Hämtade {tot} dokument.")
+        status.success(f"Klar! Sparade {tot} dokument (inklusive PDF-data).")
         st.cache_data.clear()
         time.sleep(2)
         st.rerun()
 
 # === FLIK 2: UTFORSKAREN ===
 with tab2:
-    st.header("🔍 Utforska")
-    if "valt_dokument" not in st.session_state: st.session_state["valt_dokument"] = None
+    if "valt_dok" not in st.session_state: st.session_state["valt_dok"] = None
+    df = ladda_index()
 
-    with st.spinner("Hämtar index..."):
-        df = ladda_data_fran_db()
-    
-    if df.empty:
-        st.warning("Databasen är tom.")
-    else:
-        # --- LÄS-VY ---
-        if st.session_state["valt_dokument"] is not None:
-            doc_meta = st.session_state["valt_dokument"]
-            if st.button("⬅️ Tillbaka"):
-                st.session_state["valt_dokument"] = None
-                st.rerun()
-            
-            st.divider()
-            st.subheader(f"{doc_meta['titel']}")
-            st.caption(f"{doc_meta['datum']} | {doc_meta['parti']} | ID: {doc_meta['dok_id']}")
-            
-            # HÄMTA HELA TEXTEN (INKL CHUNKS)
-            with st.spinner("Hämtar hela texten..."):
-                komplett_text = hamta_full_text(doc_meta)
-            
-            st.markdown(komplett_text)
+    if st.session_state["valt_dok"]:
+        doc = st.session_state["valt_dok"]
+        if st.button("⬅️ Lista"): 
+            st.session_state["valt_dok"] = None
+            st.rerun()
         
-        # --- LIST-VY ---
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: valda_partier = st.multiselect("Parti:", sorted([x for x in df["parti"].astype(str).unique() if x != 'nan']))
-            with c2: valda_typer = st.multiselect("Typ:", sorted([x for x in df["Kategori"].astype(str).unique() if x != 'nan']))
-            with c3: visnings_datum = st.date_input("Period:", (df["datum"].min().date(), df["datum"].max().date()))
-            with c4: sok = st.text_input("Sök:")
+        st.subheader(doc['titel'])
+        st.caption(f"ID: {doc['dok_id']} | Källa: {doc.get('Källa', 'Okänd')}")
+        st.link_button("🔗 Öppna original (Riksdagen.se)", f"https://www.riksdagen.se/sv/dokument-och-lagar/dokument/_/{doc['dok_id']}")
+        
+        with st.spinner("Laddar text..."):
+            full_txt = hamta_full_text(doc)
+            st.text_area("Innehåll", full_txt, height=600)
 
-            v_df = df.copy()
-            if len(visnings_datum) == 2:
-                v_df = v_df[(v_df['datum'].dt.date >= visnings_datum[0]) & (v_df['datum'].dt.date <= visnings_datum[1])]
-            if valda_partier: v_df = v_df[v_df["parti"].isin(valda_partier)]
-            if valda_typer: v_df = v_df[v_df["Kategori"].isin(valda_typer)]
-            if sok:
-                v_df = v_df[v_df["full_text"].str.contains(sok, case=False, na=False) | v_df["titel"].str.contains(sok, case=False, na=False)]
-            
-            v_df = v_df.sort_values("datum", ascending=False)
-            st.session_state["ai_urval"] = v_df 
-            
-            per_sida = 15
-            antal_sidor = math.ceil(len(v_df) / per_sida)
-            col_info, col_nav = st.columns([3, 2])
-            with col_info: st.caption(f"Visar {len(v_df)} dokument.")
-            with col_nav: sida = st.number_input("Sida", 1, max(1, antal_sidor), 1) if antal_sidor > 1 else 1
-
-            start = (sida - 1) * per_sida
-            for _, r in v_df.iloc[start : start + per_sida].iterrows():
-                with st.container():
-                    c1, c2, c3, c4 = st.columns([1.5, 1, 4, 1.5])
-                    c1.write(r['datum'].date())
-                    c2.write(r['parti'])
-                    c3.write(r['titel'])
-                    if c4.button("📖 Läs", key=r['dok_id']):
-                        st.session_state["valt_dokument"] = r.to_dict()
-                        st.rerun()
-                    st.divider()
+    elif not df.empty:
+        sok = st.text_input("Sök i text/titel:")
+        filt_df = df[df['titel'].str.contains(sok, case=False, na=False) | df['full_text'].str.contains(sok, case=False, na=False)] if sok else df
+        
+        for _, r in filt_df.head(20).iterrows():
+            with st.container(border=True):
+                c1, c2 = st.columns([4, 1])
+                c1.write(f"**{r['titel']}** ({r['parti']})")
+                c1.caption(f"{r['datum']} | {r['Kategori']}")
+                if c2.button("Läs", key=r['dok_id']):
+                    st.session_state["valt_dok"] = r.to_dict()
+                    st.rerun()
 
 # === FLIK 3: AI ===
 with tab3:
-    st.header("🧠 Analys")
-    if "ai_urval" in st.session_state and not st.session_state["ai_urval"].empty:
-        urval = st.session_state["ai_urval"].head(10) # Färre dokument för snabbhet
-        q = st.text_area("Fråga:", "Vad är de viktigaste punkterna?")
-        if st.button("Analysera"):
-            with st.spinner("AI läser..."):
-                ctx = ""
-                for _, r in urval.iterrows():
-                    # Vi tar bara första biten text för AI-analys för att spara tokens
-                    raw_text = r['full_text'][:2000] 
-                    ctx += f"\n--- {r['titel']} ---\n{raw_text}...\n"
-                try:
-                    res = client.models.generate_content(model="gemini-1.5-flash", contents=f"Fråga: {q}\nUnderlag:\n{ctx}")
-                    st.markdown(res.text)
-                except Exception as e: st.error(e)
+    st.header("🧠 AI-Analys")
+    if not df.empty:
+        fraga = st.text_area("Fråga din data:", "Vad handlar de senaste motionerna om?")
+        if st.button("Kör"):
+            urval = df.head(10) # Tar de 10 senaste
+            context = ""
+            for _, r in urval.iterrows():
+                context += f"\nDokument: {r['titel']}\nText: {r['full_text'][:1000]}...\n"
+            
+            try:
+                res = client.models.generate_content(model="gemini-1.5-flash", contents=f"Svara på svenska.\nFråga: {fraga}\nData:\n{context}")
+                st.markdown(res.text)
+            except Exception as e: st.error(e)

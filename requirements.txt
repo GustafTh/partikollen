@@ -3,3 +3,4 @@ pandas
 google-genai
 requests
 google-cloud-firestore
+pypdf
