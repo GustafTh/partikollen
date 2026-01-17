@@ -100,7 +100,7 @@ def spara_till_db_smart(post):
             'index': i, 'text_part': chunk, 'parent_id': post['dok_id']
         })
 
-# --- MINNES- & AI-FUNKTIONER ---
+# --- MINNES- & AI-FUNKTIONER (FIXAD LOGIK) ---
 def skapa_hash(text):
     return hashlib.md5(text.lower().strip().encode()).hexdigest()
 
@@ -119,25 +119,21 @@ def spara_analys(fraga, svar, kod=""):
     db.collection("analyser").document(fraga_id).set(data)
 
 def kor_ai_analys(full_prompt):
-    """
-    Försöker med bästa modellen först.
-    Om 1.5 Pro inte finns, testar den vanliga Pro, sen Flash.
-    """
-    # Lista med modeller att testa i ordning
-    modeller_att_testa = ["gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-pro", "gemini-1.5-flash"]
+    # Denna lista testar modeller i ordning. Om en inte finns, tar den nästa.
+    modeller = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     
-    last_error = None
-    for modell_namn in modeller_att_testa:
+    sista_fel = None
+    for m in modeller:
         try:
-            model = genai.GenerativeModel(modell_namn)
+            model = genai.GenerativeModel(m)
             response = model.generate_content(full_prompt)
-            return response.text, modell_namn # Returnera svar + vilken modell som funkade
+            return response.text, m
         except Exception as e:
-            last_error = e
-            continue # Testa nästa
+            sista_fel = e
+            continue # Testa nästa modell i listan
             
-    # Om ingen funkade, krascha med sista felet
-    raise last_error
+    # Om ingen funkade, returnera felet
+    raise sista_fel
 
 @st.cache_data(ttl=600)
 def ladda_index():
@@ -163,7 +159,7 @@ with st.sidebar:
     st.info("💡 Filtret ovan styr bara nyinhämtning. AI:n och Utforskaren ser allt i databasen.")
 
 st.title("🏛️ Partikollen Cloud ☁️")
-tab1, tab2, tab3 = st.tabs(["📡 Inhämtning", "🔍 Utforskaren", "🧠 AI-Analys (Hela databasen)"])
+tab1, tab2, tab3 = st.tabs(["📡 Inhämtning", "🔍 Utforskaren", "🧠 AI-Analys"])
 
 # === FLIK 1: INHÄMTNING ===
 with tab1:
@@ -191,21 +187,28 @@ with tab1:
                     if isinstance(docs, dict): docs = [docs]
 
                     for d in docs:
-                        did = d['dok_id']
+                        did = d['dok_id'].strip() # VIKTIGT: Rensa mellanslag
+                        
+                        # Konstruera säkra länkar
                         saker_web = f"https://www.riksdagen.se/dokument/{did}"
                         saker_pdf = f"https://data.riksdagen.se/fil/{did}"
+                        
                         ren_text, kalla = "", "HTML"
                         
+                        # Försök hämta HTML
                         try:
                             h = requests.get(f"https://data.riksdagen.se/dokument/{did}.html")
                             if h.status_code == 200: ren_text = stada_text(h.text)
                         except: pass
                         
+                        # Om HTML är tom eller "ej publicerad", hämta PDF
                         if len(ren_text) < 300 or "inte publicerat" in ren_text:
-                            status.write(f"📄 PDF: {did}")
+                            status.write(f"📄 Läser PDF för {did}...")
                             pdf_txt = hamta_pdf_text(saker_pdf)
-                            if len(pdf_txt) > len(ren_text): ren_text, kalla = pdf_txt, "PDF"
+                            if len(pdf_txt) > len(ren_text): 
+                                ren_text, kalla = pdf_txt, "PDF"
                         
+                        # Spara om vi hittade text
                         if ren_text:
                             typ_map = {"mot": "Motion", "prop": "Proposition", "bet": "Beslut"}
                             post = {
@@ -243,16 +246,22 @@ with tab2:
         
         st.title(doc['titel'])
         st.caption(f"📅 {doc['datum']} | 🏛️ {doc['parti']} | ID: {doc['dok_id']}")
+        
+        # Säkra knappar för länkar
         c1, c2 = st.columns([1, 1])
-        c1.link_button("🌐 Webb", doc.get('web_url', '#'), use_container_width=True)
-        c2.link_button("📥 PDF", doc.get('pdf_url', '#'), use_container_width=True)
+        web_link = doc.get('web_url', f"https://www.riksdagen.se/dokument/{doc['dok_id']}")
+        pdf_link = doc.get('pdf_url', f"https://data.riksdagen.se/fil/{doc['dok_id']}")
+        
+        c1.link_button("🌐 Öppna på Riksdagen.se", web_link, use_container_width=True)
+        c2.link_button("📥 Öppna PDF", pdf_link, use_container_width=True)
+        
         st.divider()
         with st.spinner("Laddar text..."):
             full_txt = hamta_full_text(doc)
-            st.markdown(full_txt if full_txt else "Ingen text hittades.")
+            st.markdown(full_txt if full_txt else "⚠️ Ingen text hittades i databasen.")
 
     elif not df.empty:
-        sok = st.text_input("🔍 Sök i listan:", placeholder="Filtrera visningen...")
+        sok = st.text_input("🔍 Sök i listan:", placeholder="T.ex. 'Kärnkraft' eller 'Sjukvård'")
         v_df = df.copy()
         if sok:
             v_df = v_df[v_df['titel'].str.contains(sok, case=False, na=False) | v_df['full_text'].str.contains(sok, case=False, na=False)]
@@ -270,13 +279,13 @@ with tab2:
 # === FLIK 3: AI-CHATT ===
 with tab3:
     st.header("🧠 Analysera hela databasen")
-    st.caption("AI:n väljer automatiskt den bästa tillgängliga modellen.")
+    st.caption("AI:n analyserar både text och statistik.")
     
     tvinga_ny = st.checkbox("🔄 Tvinga ny analys (Ignorera minnet)")
     df_all = ladda_index()
     
     if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": "Hej! Vad vill du veta om riksdagsdatan?"}]
+        st.session_state.messages = [{"role": "assistant", "content": "Hej! Vad vill du veta?"}]
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -289,8 +298,9 @@ with tab3:
         with st.chat_message("assistant"):
             sparad = hitta_sparad_analys(prompt)
             
+            # Använd sparat svar om det finns
             if sparad and not tvinga_ny:
-                st.info(f"💡 Hämtade sparat svar från {sparad['datum']}")
+                st.info(f"💡 Svar hämtat från minnet ({sparad['datum']})")
                 st.markdown(sparad['svar'])
                 st.session_state.messages.append({"role": "assistant", "content": sparad['svar']})
                 if sparad.get('kod'):
@@ -300,15 +310,17 @@ with tab3:
                         exec(sparad['kod'], {}, local_env)
                         if "fig" in local_env:
                             st.plotly_chart(local_env["fig"], use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"Kunde inte rita diagram från sparad kod: {e}")
-
+                    except: pass
+            
+            # Annars kör vi ny analys
             else:
-                with st.spinner("AI tänker..."):
+                with st.spinner("AI bearbetar..."):
                     try:
+                        # Förbered data
                         meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
                         csv_data = meta_df.to_csv(index=False)
                         
+                        # Hitta relevant text
                         keywords = prompt.lower().split()
                         df_all['relevance'] = df_all['full_text'].apply(lambda x: sum(x.lower().count(kw) for kw in keywords) if x else 0)
                         top_docs = df_all.sort_values('relevance', ascending=False).head(20)
@@ -316,23 +328,23 @@ with tab3:
                         text_context = ""
                         for _, row in top_docs.iterrows():
                             if row['relevance'] > 0:
-                                text_context += f"\n--- DOKUMENT: {row['titel']} ({row['parti']}) ---\n{row['full_text'][:2500]}...\n"
+                                text_context += f"\n--- DOKUMENT: {row['titel']} ({row['parti']}) ---\n{row['full_text'][:2000]}...\n"
 
                         system_prompt = f"""
-                        Du är en avancerad data-analytiker för Riksdagen.
-                        - Analysera CSV-datan för statistik och trender.
-                        - Analysera TEXT-datan djupt för åsikter och innehåll.
-                        - Var noga med detaljer.
-                        - Om diagram behövs: Skriv Python-kod med `px.bar` etc.
+                        Du är en data-analytiker för Riksdagen.
+                        - Analysera CSV-datan för statistik.
+                        - Analysera TEXT-datan för innehåll.
+                        - Om diagram behövs: Skriv Python-kod med `px.bar`, `px.pie` etc.
                         - Koden måste börja med ```python och sluta med ```. Spara figuren i `fig`.
                         """
                         
                         full_prompt = f"{system_prompt}\n\nCSV:\n{csv_data}\n\nTEXT:\n{text_context}\n\nFRÅGA: {prompt}"
 
-                        # KÖR MED FALLBACK-FUNKTIONEN
+                        # KÖR AI MED FALLBACK (Kraschsäkert)
                         ai_text, vald_modell = kor_ai_analys(full_prompt)
-                        st.caption(f"✅ Svar genererat av: {vald_modell}")
+                        st.caption(f"✅ Analyserat med modell: {vald_modell}")
                         
+                        # Extrahera kod och text
                         code_match = re.search(r"```python(.*?)```", ai_text, re.DOTALL)
                         clean_text = re.sub(r"```python.*?```", "", ai_text, flags=re.DOTALL)
                         kod_att_spara = code_match.group(1) if code_match else ""
@@ -351,4 +363,4 @@ with tab3:
                         spara_analys(prompt, clean_text, kod_att_spara)
 
                     except Exception as e:
-                        st.error(f"Kunde inte generera svar. Fel: {e}")
+                        st.error(f"Kunde inte analysera. Fel: {e}")
