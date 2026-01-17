@@ -1,6 +1,7 @@
 streamlit>=1.36.0
 pandas
-google-genai
+google-generativeai
 requests
 google-cloud-firestore
 pypdf
+plotly
