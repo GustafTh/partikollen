@@ -119,8 +119,8 @@ def spara_analys(fraga, svar, kod=""):
     db.collection("analyser").document(fraga_id).set(data)
 
 def kor_ai_analys(full_prompt):
-    # Denna lista testar modeller i ordning. Om en inte finns, tar den nästa.
-    modeller = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    """Kör AI-analys med fallback mellan moderna Gemini-modeller."""
+    modeller = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     
     sista_fel = None
     for m in modeller:
@@ -130,10 +130,22 @@ def kor_ai_analys(full_prompt):
             return response.text, m
         except Exception as e:
             sista_fel = e
-            continue # Testa nästa modell i listan
-            
-    # Om ingen funkade, returnera felet
-    raise sista_fel
+            continue
+    
+    # Om ingen modell fungerade, kasta errorn
+    raise Exception(f"Ingen Gemini-modell fungerade. Sista fel: {sista_fel}")
+
+
+    
+    try:
+        tillgangliga = genai.list_models()
+        for modell in modeller_prioritet:
+            if any(m.name.endswith(modell) for m in tillgangliga):
+                return modell
+    except Exception as e:
+        st.warning(f"Kunde inte lista modeller: {e}")
+    
+    return "gemini-2.0-flash"  # Fallback
 
 @st.cache_data(ttl=600)
 def ladda_index():
