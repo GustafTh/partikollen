@@ -9,18 +9,17 @@ import datetime
 from google import genai
 import sys
 
-# Fixar teckenkodning för Windows-terminaler
+# Fixar teckenkodning
 sys.stdout.reconfigure(encoding='utf-8')
 
 # --- 1. KONFIGURATION ---
 st.set_page_config(page_title="Partikollen Dashboard", page_icon="🏛️", layout="wide")
 
 # HÄMTA API-NYCKEL SÄKERT
-# Kollar secrets (molnet) eller input (lokalt)
 if "GOOGLE_API_KEY" in st.secrets:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
 else:
-    # Hårdkodad fallback för din lokala testning (Ta bort innan GitHub publicering om du vill vara extra säker)
+    # Fallback för lokal testning
     API_KEY = "AIzaSyA3XFB_3cCwzQdWhzv2m4Z0Pw62K8y-qWg"
 
 if API_KEY:
@@ -37,7 +36,7 @@ def stada_html(html_text):
     """Tvättar texten ren från kod."""
     if not html_text: return ""
     
-    # Hantera tabeller snyggt (viktigt för beslut/voteringar)
+    # Hantera tabeller snyggt
     html_text = html_text.replace("</td>", " ").replace("</th>", " ")
     html_text = html_text.replace("</tr>", "\n") 
     
@@ -79,13 +78,12 @@ def ladda_data():
             data = json.load(f)
             for rad in data:
                 rad["Kategori"] = "Beslut"
-                rad["parti"] = "Utskottet" # Betänkanden kommer från utskott
+                rad["parti"] = "Utskottet"
                 all_data.append(rad)
     
     if not all_data: return pd.DataFrame()
     
     df = pd.DataFrame(all_data)
-    # Gör om datumsträngar till riktiga datum
     if "datum" in df.columns:
         df["datum"] = pd.to_datetime(df["datum"], errors='coerce')
     return df
@@ -96,7 +94,6 @@ with st.sidebar:
     
     st.subheader("Sökintervall (Inhämtning)")
     idag = datetime.date.today()
-    # Default 30 dagar bakåt
     en_manad_sen = idag - datetime.timedelta(days=30)
     
     start_datum = st.date_input("Från:", en_manad_sen)
@@ -115,7 +112,7 @@ with st.sidebar:
 st.title("🏛️ Partikollen Dashboard")
 
 if not API_KEY:
-    st.warning("⚠️ Ingen API-nyckel hittades. Appen fungerar inte fullt ut.")
+    st.warning("⚠️ Ingen API-nyckel hittades.")
     st.stop()
 
 tab1, tab2, tab3 = st.tabs(["📡 Inhämtning", "🔍 Utforskaren", "🧠 AI-Analys"])
@@ -137,7 +134,6 @@ with tab1:
     if btn_start:
         status = st.status("Startar robotarna...", expanded=True)
         
-        # Formatera datum för API
         from_str = start_datum.strftime("%Y-%m-%d")
         tom_str = slut_datum.strftime("%Y-%m-%d")
 
@@ -154,7 +150,7 @@ with tab1:
             
             page = 1
             while page <= max_sidor:
-                # HÄR ÄR FIXEN: Vi har tagit bort "&rm=..." så den går BARA på datum.
+                # URL utan år-låsning, bara datum
                 url = f"https://data.riksdagen.se/dokumentlista/?doktyp={doktyp}&sz=20&p={page}&from={from_str}&tom={tom_str}&utformat=json"
                 
                 try:
@@ -171,7 +167,6 @@ with tab1:
                     for dok in docs:
                         did = dok['dok_id']
                         if did not in unika_id:
-                            # Hämta HTML
                             h_url = f"https://data.riksdagen.se/dokument/{did}.html"
                             h_resp = requests.get(h_url)
                             
@@ -195,14 +190,12 @@ with tab1:
                     
                     status.write(f"{label} Sida {page}: Hittade {nya_pa_sidan} nya.")
                     
-                    # Stop-loss: Om sidan är tom på nya grejer, sluta leta
                     if nya_pa_sidan == 0:
                         status.info(f"✅ Ikapp med {label}.")
                         break
                     page += 1
                     
                 except Exception as e:
-                    # Ignorera fel och försök nästa sida
                     page += 1
             
             if nya_poster:
@@ -212,7 +205,6 @@ with tab1:
             else:
                 status.write(f"Inga nya {label}.")
 
-        # Kör jobben
         if check_tal: hämta_kategori(FIL_PROTOKOLL, "prot", "Debatter")
         if check_mot: 
             hämta_kategori(FIL_FORSLAG, "mot", "Motioner")
@@ -223,16 +215,15 @@ with tab1:
         time.sleep(1)
         st.rerun()
 
-# === FLIK 2: UTFORSKAREN ===
+# === FLIK 2: UTFORSKAREN (NU MED LÄS-FUNKTION) ===
 with tab2:
-    st.header("🔍 Utforska & Filtrera")
+    st.header("🔍 Utforska & Läs")
     df = ladda_data()
     
     if df.empty:
         st.warning("Databasen är tom. Gå till fliken 'Inhämtning' först.")
     else:
-        st.caption(f"Totalt: {len(df)} dokument.")
-        
+        # Filter-UI
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             partier = sorted(df["parti"].astype(str).unique())
@@ -241,7 +232,6 @@ with tab2:
             typer = sorted(df["Kategori"].unique())
             valda_typer = st.multiselect("Typ:", typer)
         with c3:
-            # Datumfilter för VISNING (påverkar bara tabellen, inte inhämtning)
             if not df.empty:
                 d_min = df["datum"].min().date()
                 d_max = df["datum"].max().date()
@@ -249,20 +239,51 @@ with tab2:
         with c4:
             sok = st.text_input("Söktext:")
 
-        # Applicera filter
+        # Filtrering
         v_df = df.copy()
-        
         if not df.empty and 'visnings_datum' in locals() and len(visnings_datum) == 2:
             v_df = v_df[(v_df['datum'].dt.date >= visnings_datum[0]) & (v_df['datum'].dt.date <= visnings_datum[1])]
-            
         if valda_partier: v_df = v_df[v_df["parti"].isin(valda_partier)]
         if valda_typer: v_df = v_df[v_df["Kategori"].isin(valda_typer)]
         if sok:
             v_df = v_df[v_df["full_text"].str.contains(sok, case=False, na=False) | v_df["titel"].str.contains(sok, case=False, na=False)]
 
-        st.info(f"Visar {len(v_df)} dokument.")
-        st.dataframe(v_df[["datum", "Kategori", "parti", "titel"]].sort_values("datum", ascending=False), use_container_width=True, hide_index=True)
+        # Sortera för visning
+        visnings_tabell = v_df[["datum", "Kategori", "parti", "titel"]].sort_values("datum", ascending=False)
         
+        st.info(f"Visar {len(v_df)} dokument. Klicka på en rad för att läsa!")
+
+        # --- KLICKBAR TABELL (NYTT) ---
+        event = st.dataframe(
+            visnings_tabell,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun", # Gör att sidan laddas om vid klick
+            selection_mode="single-row" # Man får bara välja en åt gången
+        )
+
+        # --- VISA TEXT OM VALD ---
+        if event.selection.rows:
+            # Hämta index på den valda raden
+            valt_index = event.selection.rows[0]
+            # Hämta rätt rad från vår sorterade tabell
+            vald_rad = visnings_tabell.iloc[valt_index]
+            
+            # Hitta originaltexten i stora dataframen (v_df)
+            # Vi matchar på titel och datum för säkerhets skull
+            full_post = v_df[
+                (v_df['datum'] == vald_rad['datum']) & 
+                (v_df['titel'] == vald_rad['titel'])
+            ].iloc[0]
+
+            st.divider()
+            st.subheader(f"📖 {full_post['titel']}")
+            st.caption(f"Datum: {full_post['datum']} | Typ: {full_post['Kategori']} | Parti: {full_post['parti']}")
+            
+            with st.container(height=500): # Scrollbar ruta
+                st.markdown(full_post['full_text'])
+        
+        # Spara urvalet till AI
         st.session_state["ai_urval"] = v_df
 
 # === FLIK 3: AI-ANALYS ===
@@ -279,7 +300,7 @@ with tab3:
 
         q_default = "Sammanfatta konflikterna och ståndpunkterna."
         if "Beslut" in urval["Kategori"].values:
-            q_default = "Vad handlar dessa beslut om? Vilka reservationer finns? Vad blev resultatet?"
+            q_default = "Vad handlar dessa beslut om? Vad blev resultatet?"
 
         fraga = st.text_area("Fråga:", q_default)
         

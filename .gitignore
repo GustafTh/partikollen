@@ -1,4 +1,3 @@
 __pycache__/
-*.json
 .env
 secrets.toml
