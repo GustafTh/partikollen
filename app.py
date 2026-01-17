@@ -119,20 +119,25 @@ def spara_analys(fraga, svar, kod=""):
     db.collection("analyser").document(fraga_id).set(data)
 
 def kor_ai_analys(full_prompt):
-    """Försöker med bästa modellen först, faller tillbaka på stabil om det krånglar."""
-    modeller_att_testa = ["gemini-1.5-pro-latest", "gemini-1.5-pro", "gemini-pro"]
+    """
+    Försöker med bästa modellen först.
+    Om 1.5 Pro inte finns, testar den vanliga Pro, sen Flash.
+    """
+    # Lista med modeller att testa i ordning
+    modeller_att_testa = ["gemini-1.5-pro", "gemini-1.5-pro-latest", "gemini-pro", "gemini-1.5-flash"]
     
+    last_error = None
     for modell_namn in modeller_att_testa:
         try:
             model = genai.GenerativeModel(modell_namn)
             response = model.generate_content(full_prompt)
             return response.text, modell_namn # Returnera svar + vilken modell som funkade
         except Exception as e:
-            # Om det är sista modellen och det fortfarande inte funkar, kasta felet
-            if modell_namn == modeller_att_testa[-1]:
-                raise e
-            continue # Annars, testa nästa i listan
-    return None, None
+            last_error = e
+            continue # Testa nästa
+            
+    # Om ingen funkade, krascha med sista felet
+    raise last_error
 
 @st.cache_data(ttl=600)
 def ladda_index():
@@ -293,3 +298,57 @@ with tab3:
                         meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
                         local_env = {"meta_df": meta_df, "pd": pd, "px": px}
                         exec(sparad['kod'], {}, local_env)
+                        if "fig" in local_env:
+                            st.plotly_chart(local_env["fig"], use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Kunde inte rita diagram från sparad kod: {e}")
+
+            else:
+                with st.spinner("AI tänker..."):
+                    try:
+                        meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
+                        csv_data = meta_df.to_csv(index=False)
+                        
+                        keywords = prompt.lower().split()
+                        df_all['relevance'] = df_all['full_text'].apply(lambda x: sum(x.lower().count(kw) for kw in keywords) if x else 0)
+                        top_docs = df_all.sort_values('relevance', ascending=False).head(20)
+                        
+                        text_context = ""
+                        for _, row in top_docs.iterrows():
+                            if row['relevance'] > 0:
+                                text_context += f"\n--- DOKUMENT: {row['titel']} ({row['parti']}) ---\n{row['full_text'][:2500]}...\n"
+
+                        system_prompt = f"""
+                        Du är en avancerad data-analytiker för Riksdagen.
+                        - Analysera CSV-datan för statistik och trender.
+                        - Analysera TEXT-datan djupt för åsikter och innehåll.
+                        - Var noga med detaljer.
+                        - Om diagram behövs: Skriv Python-kod med `px.bar` etc.
+                        - Koden måste börja med ```python och sluta med ```. Spara figuren i `fig`.
+                        """
+                        
+                        full_prompt = f"{system_prompt}\n\nCSV:\n{csv_data}\n\nTEXT:\n{text_context}\n\nFRÅGA: {prompt}"
+
+                        # KÖR MED FALLBACK-FUNKTIONEN
+                        ai_text, vald_modell = kor_ai_analys(full_prompt)
+                        st.caption(f"✅ Svar genererat av: {vald_modell}")
+                        
+                        code_match = re.search(r"```python(.*?)```", ai_text, re.DOTALL)
+                        clean_text = re.sub(r"```python.*?```", "", ai_text, flags=re.DOTALL)
+                        kod_att_spara = code_match.group(1) if code_match else ""
+
+                        st.markdown(clean_text)
+                        st.session_state.messages.append({"role": "assistant", "content": clean_text})
+                        
+                        if kod_att_spara:
+                            local_env = {"meta_df": meta_df, "top_docs": top_docs, "pd": pd, "px": px}
+                            try:
+                                exec(kod_att_spara, {}, local_env)
+                                if "fig" in local_env:
+                                    st.plotly_chart(local_env["fig"], use_container_width=True)
+                            except Exception as e: st.warning(f"Kunde inte rita diagrammet: {e}")
+
+                        spara_analys(prompt, clean_text, kod_att_spara)
+
+                    except Exception as e:
+                        st.error(f"Kunde inte generera svar. Fel: {e}")
