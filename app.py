@@ -105,18 +105,27 @@ def skapa_hash(text):
     return hashlib.md5(text.lower().strip().encode()).hexdigest()
 
 def hitta_sparad_analys(fraga):
-    fraga_id = skapa_hash(fraga)
-    doc = db.collection("analyser").document(fraga_id).get()
-    if doc.exists: return doc.to_dict()
+    """Hämtar sparad analys från Firestore med error-hantering."""
+    try:
+        fraga_id = skapa_hash(fraga)
+        doc = db.collection("analyser").document(fraga_id).get(timeout=5)
+        if doc.exists: 
+            return doc.to_dict()
+    except Exception as e:
+        st.warning(f"⚠️ Kunde inte hämta från minne: {e}")
     return None
 
 def spara_analys(fraga, svar, kod=""):
-    fraga_id = skapa_hash(fraga)
-    data = {
-        "fraga": fraga, "svar": svar, "kod": kod,
-        "datum": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    db.collection("analyser").document(fraga_id).set(data)
+    """Sparar analys till Firestore med error-hantering."""
+    try:
+        fraga_id = skapa_hash(fraga)
+        data = {
+            "fraga": fraga, "svar": svar, "kod": kod,
+            "datum": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        db.collection("analyser").document(fraga_id).set(data, timeout=5)
+    except Exception as e:
+        st.warning(f"⚠️ Kunde inte spara i minne: {e}")
 
 def kor_ai_analys(full_prompt):
     """Kör AI-analys med fallback mellan moderna Gemini-modeller."""
@@ -134,18 +143,6 @@ def kor_ai_analys(full_prompt):
     
     # Om ingen modell fungerade, kasta errorn
     raise Exception(f"Ingen Gemini-modell fungerade. Sista fel: {sista_fel}")
-
-
-    
-    try:
-        tillgangliga = genai.list_models()
-        for modell in modeller_prioritet:
-            if any(m.name.endswith(modell) for m in tillgangliga):
-                return modell
-    except Exception as e:
-        st.warning(f"Kunde inte lista modeller: {e}")
-    
-    return "gemini-2.0-flash"  # Fallback
 
 @st.cache_data(ttl=600)
 def ladda_index():
