@@ -132,6 +132,9 @@ def kor_ai_analys(full_prompt):
     modeller = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     
     sista_fel = None
+    retry_count = 0
+    max_retries = 3
+    
     for m in modeller:
         try:
             model = genai.GenerativeModel(m)
@@ -139,9 +142,19 @@ def kor_ai_analys(full_prompt):
             return response.text, m
         except Exception as e:
             sista_fel = e
+            if "429" in str(e) or "Quota" in str(e):
+                retry_count += 1
+                if retry_count < max_retries:
+                    vanta_tid = 30 * retry_count  # 30s, 60s, 90s
+                    st.warning(f"🔄 API-gränsen nådd. Försök {retry_count}/{max_retries}. Väntar {vanta_tid}s...")
+                    time.sleep(vanta_tid)
+                    # Försök igen med samma modell
+                    try:
+                        response = model.generate_content(full_prompt)
+                        return response.text, m
+                    except: pass
             continue
     
-    # Om ingen modell fungerade, kasta errorn
     raise Exception(f"Ingen Gemini-modell fungerade. Sista fel: {sista_fel}")
 
 @st.cache_data(ttl=600)
@@ -325,31 +338,27 @@ with tab3:
             else:
                 with st.spinner("AI bearbetar..."):
                     try:
-                        # Förbered data
-                        meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].copy()
+                        # Förbered data - TIER 1 OPTIMERAD
+                        meta_df = df_all[['dok_id', 'titel', 'parti', 'datum', 'Kategori', 'beslut']].head(20).copy()
                         csv_data = meta_df.to_csv(index=False)
                         
-                        # Hitta relevant text
+                        # Hitta relevant text - MAXIMALT 2 DOKUMENT
                         keywords = prompt.lower().split()
                         df_all['relevance'] = df_all['full_text'].apply(lambda x: sum(x.lower().count(kw) for kw in keywords) if x else 0)
-                        top_docs = df_all.sort_values('relevance', ascending=False).head(20)
+                        top_docs = df_all.sort_values('relevance', ascending=False).head(2)  # Från 3 → 2
                         
                         text_context = ""
                         for _, row in top_docs.iterrows():
                             if row['relevance'] > 0:
-                                text_context += f"\n--- DOKUMENT: {row['titel']} ({row['parti']}) ---\n{row['full_text'][:2000]}...\n"
+                                # Minska från 800 till 600 tecken
+                                text_context += f"\n--- {row['titel']} ({row['parti']}) ---\n{row['full_text'][:600]}\n"
 
-                        system_prompt = f"""
-                        Du är en data-analytiker för Riksdagen.
-                        - Analysera CSV-datan för statistik.
-                        - Analysera TEXT-datan för innehåll.
-                        - Om diagram behövs: Skriv Python-kod med `px.bar`, `px.pie` etc.
-                        - Koden måste börja med ```python och sluta med ```. Spara figuren i `fig`.
-                        """
+                        system_prompt = """Du är en data-analytiker för Riksdagen. Ge KORTA, FOKUSERADE svar (max 3 paragrafer).
+Om diagram: Skriv Python med `px.bar`, `px.pie`. Kod mellan ```python och ```."""
                         
-                        full_prompt = f"{system_prompt}\n\nCSV:\n{csv_data}\n\nTEXT:\n{text_context}\n\nFRÅGA: {prompt}"
+                        full_prompt = f"{system_prompt}\n\nDATA (CSV):\n{csv_data}\n\nTEXT:\n{text_context}\n\nFRÅGA: {prompt}"
 
-                        # KÖR AI MED FALLBACK (Kraschsäkert)
+                        # KÖR AI MED FALLBACK
                         ai_text, vald_modell = kor_ai_analys(full_prompt)
                         st.caption(f"✅ Analyserat med modell: {vald_modell}")
                         
